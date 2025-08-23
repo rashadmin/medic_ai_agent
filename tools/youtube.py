@@ -5,7 +5,7 @@ from langchain_core.messages import ToolMessage
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.types import Command
 import isodate  # For parsing ISO 8601 durations
-
+import os
 @tool('search_youtube_videos',parse_docstring=True)
 def search_youtube_videos(query:Annotated[str,'query string of the emergency procedure the user requested'],
                           max_results:Annotated[int,' Max videos to return'],
@@ -17,7 +17,7 @@ def search_youtube_videos(query:Annotated[str,'query string of the emergency pro
         query (str): Search term
         max_results (int): Max videos to return
     """
-    api_key = "AIzaSyBh5MDHDejZfIZ7t5z2ekLJh54_wihtIHM"
+    api_key = os.environ.get("YOUTUBE_API_KEY")
     youtube = build('youtube', 'v3', developerKey=api_key)
 
     min_duration =1

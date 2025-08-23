@@ -8,6 +8,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, TypedDict
 import os
+import requests
 from agent_functions.extracting_info import get_extracted_information
 from typing import Annotated
 from typing_extensions import TypedDict
@@ -21,6 +22,10 @@ from tools.human_assistant import human_assistant
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.prebuilt import ToolNode,tools_condition
 from langgraph.checkpoint.memory import InMemorySaver
+import redis
+
+
+url = "https://api.geoapify.com/v2/places?categories=healthcare.hospital,healthcare&filter=circle:3.3923165374758533,6.542001055294039,5000&bias=proximity:3.3923165374758533,6.542001055294039&limit=20&apiKey=8afc9b32319e44e584ff990567aac9ec"
 
 llm = init_chat_model("gemini-2.5-flash", model_provider="google_genai")
 os.environ["LANGSMITH_TRACING"] = "true"
@@ -37,6 +42,7 @@ def add_link(left,right):
 @dataclass
 class ContextSchema(TypedDict):
     picked: bool = False
+    extracted : bool = False
 
 
 class State(TypedDict):
@@ -44,6 +50,7 @@ class State(TypedDict):
     report: dict
     symptoms: Annotated[set[str],add_symptoms]
     youtube_link : Annotated[list,add_link]
+    user_id:str
 
 from typing import Optional,List,Set
 class Person(BaseModel):
@@ -87,8 +94,33 @@ def extraction(state:State,runtime: Runtime[ContextSchema]):
         symptoms = set(structured_response['symptoms'])
         keys_to_get = ['situation','age','gender','surgical_status','trauma_name','trauma_description','physicians']
         report = {key: structured_response[key] for key in keys_to_get if key in structured_response}
-        return {'report':report,'symptoms':symptoms}
+        reformatted_report ={key:(','.join(value) if type(value) is list else value) for key,value in report.items()}
+        return {'report':reformatted_report,'symptoms':symptoms}
 
+
+
+def hospital_request(state:State):
+    response = requests.get(url)
+    r = redis.Redis(host='localhost', port=6379,decode_responses=True)
+    for i in response.json()['features']:
+        if 'name' in i['properties'].keys():
+            stream_id = i['properties']['place_id'][:8]
+            report_to_be_sent = state['report']
+            report_to_be_sent.update({'user':state['user_id']})
+            print(report_to_be_sent)
+            # print()
+            r.xadd(stream_id,report_to_be_sent)
+    return {}
+    # deadline = time.time() + 120
+    # while time.time() < deadline:
+    #     msgs = r.xread({state["user_id"]: "$"}, block=2000)  # wait 2s
+    #     if msgs:
+    #         for stream, events in msgs:
+    #             for msg_id, data in events:
+    #                 if data["request_id"] == request_id:  # filter only my request
+    #                     print("Got response:", data)
+    #                     break
+        
 
 def chatbot(state:State,runtime: Runtime[ContextSchema]):
     first_aid_prompt_template = ChatPromptTemplate([('system',
@@ -112,11 +144,14 @@ def chatbot(state:State,runtime: Runtime[ContextSchema]):
 
 
     if runtime.context['picked']:
+        if runtime.context['extracted']:
+            first_aid_prompt = first_aid_prompt_template.invoke({'query':state['messages'][0].content,'symptoms':state['symptoms'],'information':''})#the extracted information
+        elif not runtime.context['extracted']:
         # making sure extract does not run twice
-        extract = get_extracted_information()
-        extracted_information =  extract.invoke(state)#get_extracted_info
-        first_aid_prompt = first_aid_prompt_template.invoke({'query':state['messages'][0].content,'symptoms':state['symptoms'],'information':extracted_information})#the extracted information
-        ##############################
+            extract = get_extracted_information()
+            extracted_information =  extract.invoke(state)#get_extracted_info
+            first_aid_prompt = first_aid_prompt_template.invoke({'query':state['messages'][0].content,'symptoms':state['symptoms'],'information':extracted_information})#the extracted information
+            ##############################
         messages = [first_aid_prompt.messages[0]]+state['messages']
         message = llm_with_tools.invoke(messages)
         assert(len(message.tool_calls) <= 1)
@@ -133,12 +168,15 @@ llm_with_tools = llm.bind_tools(tools)
 
 builder = StateGraph(State,context_schema=ContextSchema)
 builder.add_node(extraction)
+builder.add_node(hospital_request)
 builder.add_node(chatbot)
 tool_node = ToolNode(tools=tools)
 builder.add_node("tools", tool_node)
 builder.add_edge(START,'extraction')
+builder.add_edge('extraction','hospital_request')
 builder.add_edge('extraction','chatbot')
 builder.add_edge('tools','chatbot')
+builder.add_edge('hospital_request',END)
 builder.add_conditional_edges("chatbot", tools_condition)
 # add a conditional edge
 # builder.add_edge('human_assistant',END)
